@@ -87,7 +87,8 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                  feature_slices: Optional[list] = None,
                  train_only_features_to_minimize: Optional[bool] = True,
                  is_regression: Optional[bool] = False,
-                 generalize_using_transform: bool = True):
+                 generalize_using_transform: bool = True,
+                 max_depth: Optional[int] = None):
 
         self.estimator = estimator
         if estimator is not None and not issubclass(estimator.__class__, Model):
@@ -119,6 +120,7 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         self._dt = None
         self._features = None
         self._level = 0
+        self.max_depth = max_depth
         if cells:
             self._calculate_generalizations()
 
@@ -321,7 +323,7 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                 self._dt = DecisionTreeRegressor(random_state=10, min_samples_split=2, min_samples_leaf=1)
             else:
                 self._dt = DecisionTreeClassifier(random_state=0, min_samples_split=2,
-                                                  min_samples_leaf=1)
+                                                  min_samples_leaf=1, max_depth=self.max_depth)
 
             # prepare data for DT
             self._encode_categorical_features(used_data, save_mapping=True)
