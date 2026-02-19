@@ -19,6 +19,8 @@ from apt.utils.datasets import ArrayDataset, DATA_PANDAS_NUMPY_TYPE
 from apt.utils.models import Model, SklearnRegressor, SklearnClassifier, \
     CLASSIFIER_SINGLE_OUTPUT_CLASS_PROBABILITIES
 
+from diffprivlib.models import DecisionTreeClassifier as DPTreeClassifier
+
 
 @dataclass
 class NCPScores:
@@ -88,6 +90,7 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                  train_only_features_to_minimize: Optional[bool] = True,
                  is_regression: Optional[bool] = False,
                  generalize_using_transform: bool = True,
+                 privacy_budget = None,
                  max_depth: Optional[int] = None):
 
         self.estimator = estimator
@@ -120,6 +123,7 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         self._dt = None
         self._features = None
         self._level = 0
+        self.privacy_budget = privacy_budget
         self.max_depth = max_depth
         if cells:
             self._calculate_generalizations()
@@ -320,15 +324,39 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
             self._categorical_values = {}
 
             if self.is_regression:
+                # TODO: add diffprivlib modelf or regression as well
                 self._dt = DecisionTreeRegressor(random_state=10, min_samples_split=2, min_samples_leaf=1)
             else:
-                self._dt = DecisionTreeClassifier(random_state=0, min_samples_split=2,
-                                                  min_samples_leaf=1, max_depth=self.max_depth)
+                # preparing data for DT
+                self._encode_categorical_features(used_data, save_mapping=True)
+                x_prepared = self._encode_categorical_features(used_x_train)
 
-            # prepare data for DT
-            self._encode_categorical_features(used_data, save_mapping=True)
-            x_prepared = self._encode_categorical_features(used_x_train)
-            self._dt.fit(x_prepared, y_train)
+                # check if privacy budget (epsilon) is set
+                if hasattr(self, 'privacy_budget') and self.privacy_budget is not None and self.privacy_budget:
+                    
+                    # calculating bounds (feature domain)
+                    bounds = self._calculate_bounds(x_prepared)
+                    
+                    # get unique classes for the model
+                    if isinstance(y_train, pd.Series):
+                        classes = y_train.unique()
+                    else:
+                        classes = np.unique(y_train)
+
+                    # define DP Tree classifier
+                    self._dt = DPTreeClassifier(epsilon=self.privacy_budget, 
+                                                bounds=bounds,
+                                                classes=classes, max_depth=self.max_depth,
+                                                random_state=10 if self.is_regression else 0)
+                    
+                    self._dt.fit(x_prepared, y_train)
+                    print(f"Trained DP Decision Tree (epsilon={self.privacy_budget})")
+                else:
+                    # if there is no privacy budget then just use the original logic
+                    self._dt = DecisionTreeClassifier(random_state=0, min_samples_split=2, min_samples_leaf=1, max_depth=self.max_depth)
+                    self._dt.fit(x_prepared, y_train)
+                    print(f"Trained SkLearn Decision Tree with no privacy budget")
+
             x_prepared_test = self._encode_categorical_features(used_x_test)
 
             self._calculate_cells()
@@ -850,10 +878,12 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         # return all nodes with depth == level or leaves higher than level
         return [i for i, x in enumerate(node_depth) if x == depth or (x < depth and is_leaves[i])]
 
+
     def _attach_cells_representatives(self, prepared_data, original_train_features, label_feature, level_nodes):
         # prepared data include one hot encoded categorical data,
         # if there is no categorical data prepared data is original data
         nodeIds = self._find_sample_nodes(prepared_data, level_nodes)
+        
         for cell in self.cells:
             cell['representative'] = {}
             # get all rows in cell
@@ -868,25 +898,60 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
             else:
                 labels_df = pd.DataFrame(label_feature, columns=['label'])
                 sample_labels = labels_df.iloc[indexes]['label'].values.tolist()
-                indexes = [i for i, label in enumerate(sample_labels) if label == cell['label'][0]]
+                
+                # cell['label'] might be empty or mismatched - handling this
+                if len(cell['label']) > 0:
+                    target_label = cell['label'][0]
+                    indexes = [i for i, label in enumerate(sample_labels) if label == target_label]
+                else:
+                    indexes = []
+                    
                 match_samples = sample_rows.iloc[indexes]
                 match_rows = original_rows.iloc[indexes]
+
+            # fixing for empty leaves - to handle the errors thrown by diffprivlib DP tree
+            if len(match_samples) == 0:
+                # Fallback: use the center of the cell's constraints
+                for feature in cell['ranges'].keys():
+                    r = cell['ranges'][feature]
+                    # use global bounds if local bounds are infinite/None
+                    global_min = self._feature_data[feature]['min']
+                    global_max = self._feature_data[feature]['max']
+                    
+                    start = r['start'] if r['start'] is not None else global_min
+                    end = r['end'] if r['end'] is not None else global_max
+                    
+                    # taking the midpoint as the representative
+                    cell['representative'][feature] = (start + end) / 2
+                
+                for feature in cell['categories'].keys():
+                    # Fallback: pick the first allowed category in this leaf
+                    allowed = cell['categories'][feature]
+                    if allowed:
+                        # if it's a list of lists, flatten or pick first
+                        if isinstance(allowed[0], list):
+                             cell['representative'][feature] = allowed[0][0]
+                        else:
+                             cell['representative'][feature] = allowed[0]
+                continue
 
             # find the "middle" of the cluster
             array = match_samples.values
             # Only works with numpy 1.9.0 and higher!!!
             median = np.median(array, axis=0)
             i = 0
-            min = len(array)
             min_dist = float("inf")
+            min_index = 0
+            
             for row in array:
                 dist = distance.euclidean(row, median)
                 if dist < min_dist:
                     min_dist = dist
-                    min = i
+                    min_index = i
                 i = i + 1
+            
             # since this is an actual row from the data, correct one-hot encoding is already guaranteed
-            row = match_rows.iloc[min]
+            row = match_rows.iloc[min_index]
             for feature in cell['ranges'].keys():
                 cell['representative'][feature] = row[feature]
             for feature in cell['categories'].keys():
@@ -1377,3 +1442,39 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
     def _calculate_accuracy(generalized, y_test, estimator, encoder):
         generalized_data = encoder.transform(generalized) if encoder else generalized
         return estimator.score(ArrayDataset(generalized_data, y_test))
+
+    def _calculate_bounds(self, x_prepared):
+        """
+        Helper method to extract feature bounds for diffprivlib.
+        Returns a tuple of two lists: ([min1, min2, ...], [max1, max2, ...])
+        """
+        mins = []
+        maxs = []
+        
+        # for pandas dataframes
+        if hasattr(x_prepared, 'columns'):
+            for col in x_prepared.columns:
+                col_min = x_prepared[col].min()
+                col_max = x_prepared[col].max()
+                
+                # for constant features
+                if col_min == col_max:
+                    col_max += 1e-5
+                    
+                mins.append(col_min)
+                maxs.append(col_max)
+        
+        # for numpy array
+        else:
+            for i in range(x_prepared.shape[1]):
+                col_data = x_prepared[:, i]
+                col_min = np.min(col_data)
+                col_max = np.max(col_data)
+                
+                if col_min == col_max:
+                    col_max += 1e-5
+                    
+                mins.append(col_min)
+                maxs.append(col_max)
+                
+        return (mins, maxs)
