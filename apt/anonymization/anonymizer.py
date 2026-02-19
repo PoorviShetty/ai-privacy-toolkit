@@ -215,7 +215,8 @@ class Anonymize:
         numeric_transformer = Pipeline(
             steps=[('imputer', SimpleImputer(strategy='constant', fill_value=0))]
         )
-        categorical_transformer = OneHotEncoder(handle_unknown="ignore", sparse=False)
+        #categorical_transformer = OneHotEncoder(handle_unknown="ignore", sparse=False)
+        categorical_transformer = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
         preprocessor = ColumnTransformer(
             transformers=[
                 ("num", numeric_transformer, numeric_features),

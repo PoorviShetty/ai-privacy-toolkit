@@ -616,7 +616,8 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
             else:
                 raise TypeError("feature " + str(feature) + " not found in cell " + str(cell['id']))
         # Mark as mapped
-        mapped.itemset(index, 1)
+        # mapped.itemset(index, 1)
+        mapped[index] = 1
         return True
 
     def _encode_categorical_features(self, x, save_mapping=False):
