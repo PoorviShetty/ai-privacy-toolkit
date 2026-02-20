@@ -91,7 +91,8 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                  is_regression: Optional[bool] = False,
                  generalize_using_transform: bool = True,
                  privacy_budget = None,
-                 max_depth: Optional[int] = None):
+                 max_depth: Optional[int] = None,
+                 l_diversity_threshold: Optional[float] = None):
 
         self.estimator = estimator
         if estimator is not None and not issubclass(estimator.__class__, Model):
@@ -125,6 +126,7 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         self._level = 0
         self.privacy_budget = privacy_budget
         self.max_depth = max_depth
+        self.l_diversity_threshold = l_diversity_threshold
         if cells:
             self._calculate_generalizations()
 
@@ -378,14 +380,21 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                   '(base generalization derived from tree, before improvements): %f' % accuracy)
 
             # if accuracy above threshold, improve generalization
-            if accuracy > self.target_accuracy:
-                print('Improving generalizations')
+            is_safe = self._is_level_safe(self.cells)
+            
+            # prune if accuracy is higher than needed OR if the current state is unsafe
+            if accuracy > self.target_accuracy or not is_safe:
+                print(f'Improving generalizations (Target: Acc <= {self.target_accuracy:.4f} AND Safe == True)')
                 self._level = 0
-                while accuracy > self.target_accuracy:
+                
+                while accuracy > self.target_accuracy or not is_safe:
+                    prev_was_safe = is_safe
                     self._level += 1
-                    cells_previous_iter = self.cells
-                    generalization_prev_iter = self._generalizations
-                    cells_by_id_prev = self._cells_by_id
+                    
+                    # store previous state in case we need to roll back
+                    cells_previous_iter = copy.deepcopy(self.cells)
+                    generalization_prev_iter = copy.deepcopy(self._generalizations)
+                    cells_by_id_prev = copy.deepcopy(self._cells_by_id)
                     nodes = self._get_nodes_level(self._level)
 
                     try:
@@ -395,19 +404,31 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                         self._level -= 1
                         break
 
+                    # update representatives and calculate new accuracy/safety
                     self._attach_cells_representatives(x_prepared, used_x_train, y_train, nodes)
-
                     generalized = self._generalize(x_test, x_prepared_test, nodes)
                     accuracy = self._calculate_accuracy(generalized, y_test, self.estimator, self.encoder)
-                    # if accuracy passed threshold roll back to previous iteration generalizations
+                    is_safe = self._is_level_safe(self.cells)
+                    
                     if accuracy < self.target_accuracy:
-                        self.cells = cells_previous_iter
-                        self._generalizations = generalization_prev_iter
-                        self._cells_by_id = cells_by_id_prev
-                        self._level -= 1
-                        break
+                        if is_safe and prev_was_safe:
+                            # both states are safe, but current failed accuracy - rolling back to the more accurate one.
+                            self.cells = cells_previous_iter
+                            self._generalizations = generalization_prev_iter
+                            self._cells_by_id = cells_by_id_prev
+                            self._level -= 1
+                            break
+                        elif is_safe and not prev_was_safe:
+                            # achieved safety, but accuracy is below target
+                            # tradeoff here: accepting the accuracy to protect privacy
+                            print('Pruned tree to level: %d. Achieved safety! New relative accuracy: %f' % (self._level, accuracy))
+                            break
+                        elif not is_safe:
+                            # state is still unsafe, keep pruning even though accuracy is suffering
+                            print('Pruned tree to level: %d. Still unsafe. New relative accuracy: %f' % (self._level, accuracy))
+                            continue
                     else:
-                        print('Pruned tree to level: %d, new relative accuracy: %f' % (self._level, accuracy))
+                        print('Pruned tree to level: %d. Safe: %s, new relative accuracy: %f' % (self._level, is_safe, accuracy))
 
             # if accuracy below threshold, improve accuracy by removing features from generalization
             elif accuracy < self.target_accuracy:
@@ -1478,3 +1499,29 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                 maxs.append(col_max)
                 
         return (mins, maxs)
+    
+    def _is_level_safe(self, cells):
+        """
+        Checks if all generalization cells satisfy the l-diversity constraint.
+        Returns True if safe, False if vulnerable to homogeneity attacks.
+        """
+        # default to original behavior if the param is not set
+        if getattr(self, 'l_diversity_threshold', None) is None:
+            return True 
+            
+        for cell in cells:
+            # get the target class counts in this leaf
+            counts = np.ravel(cell['hist'])
+            total = np.sum(counts)
+            
+            # if cell is empty, it contains no real users to leak
+            if total == 0:
+                continue 
+                
+            max_prob = np.max(counts) / total
+            
+            # if a single class dominates the leaf beyond our threshold, it is unsafe!
+            if max_prob > self.l_diversity_threshold:
+                return False
+                
+        return True
