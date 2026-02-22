@@ -92,7 +92,8 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                  generalize_using_transform: bool = True,
                  privacy_budget = None,
                  max_depth: Optional[int] = None,
-                 l_diversity_threshold: Optional[float] = None):
+                 l_diversity_threshold: Optional[float] = None,
+                 max_disclosure_risk: Optional[float] = None):
 
         self.estimator = estimator
         if estimator is not None and not issubclass(estimator.__class__, Model):
@@ -127,6 +128,7 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         self.privacy_budget = privacy_budget
         self.max_depth = max_depth
         self.l_diversity_threshold = l_diversity_threshold
+        self.max_disclosure_risk = max_disclosure_risk
         if cells:
             self._calculate_generalizations()
 
@@ -329,6 +331,8 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                 # TODO: add diffprivlib modelf or regression as well
                 self._dt = DecisionTreeRegressor(random_state=10, min_samples_split=2, min_samples_leaf=1)
             else:
+                ##########################################
+                ### FEATURE 1: DIFFPRIVLIB FEATURE
                 # preparing data for DT
                 self._encode_categorical_features(used_data, save_mapping=True)
                 x_prepared = self._encode_categorical_features(used_x_train)
@@ -358,6 +362,8 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                     self._dt = DecisionTreeClassifier(random_state=0, min_samples_split=2, min_samples_leaf=1, max_depth=self.max_depth)
                     self._dt.fit(x_prepared, y_train)
                     print(f"Trained SkLearn Decision Tree with no privacy budget")
+            
+            ##########################################
 
             x_prepared_test = self._encode_categorical_features(used_x_test)
 
@@ -379,6 +385,8 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
             print('Initial accuracy of model on generalized data, relative to original model predictions '
                   '(base generalization derived from tree, before improvements): %f' % accuracy)
 
+            ##########################################
+            ### FEATURE 2: L DIVERSITY FEATURE
             # if accuracy above threshold, improve generalization
             is_safe = self._is_level_safe(self.cells)
             
@@ -429,6 +437,8 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                             continue
                     else:
                         print('Pruned tree to level: %d. Safe: %s, new relative accuracy: %f' % (self._level, is_safe, accuracy))
+            ################################################
+
 
             # if accuracy below threshold, improve accuracy by removing features from generalization
             elif accuracy < self.target_accuracy:
@@ -920,13 +930,14 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                 labels_df = pd.DataFrame(label_feature, columns=['label'])
                 sample_labels = labels_df.iloc[indexes]['label'].values.tolist()
                 
+            ##########################################
+            ### FEATURE 1: DIFFPRIVLIB FEATURE
                 # cell['label'] might be empty or mismatched - handling this
                 if len(cell['label']) > 0:
                     target_label = cell['label'][0]
                     indexes = [i for i, label in enumerate(sample_labels) if label == target_label]
                 else:
                     indexes = []
-                    
                 match_samples = sample_rows.iloc[indexes]
                 match_rows = original_rows.iloc[indexes]
 
@@ -955,6 +966,7 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                         else:
                              cell['representative'][feature] = allowed[0]
                 continue
+            ##########################################
 
             # find the "middle" of the cluster
             array = match_samples.values
@@ -1105,6 +1117,29 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                                               current_accuracy, generalize_using_transform)
         if feature is None:
             return None
+
+        ###############################
+        ### FEATURE 3: RISK BOUNDING FEATURE
+        # implementing active risk bounding
+        if hasattr(self, 'max_disclosure_risk') and self.max_disclosure_risk is not None:
+            # simulate the removal of this feature in a temporary sandbox
+            simulated_cells = copy.deepcopy(self.cells)
+            simulated_cells_by_id = copy.deepcopy(self._cells_by_id)
+            self._remove_feature_from_cells_internal(simulated_cells, simulated_cells_by_id, [feature])
+            
+            # generate the projected dataset with this feature exposed
+            simulated_generalized = self._generalize_from_tree(original_data, prepared_data, nodes, simulated_cells, simulated_cells_by_id)
+            
+            # calculate resulting identity risk
+            projected_risk = self._calculate_disclosure_risk(simulated_generalized)
+            
+            # enforce the safety boundary
+            if projected_risk > self.max_disclosure_risk:
+                print(f"SECURITY VETO: Removing '{feature}' increases Disclosure Risk to {projected_risk:.3f} "
+                      f"(Limit: {self.max_disclosure_risk}). Halting accuracy optimization.")
+                return None # loop stops, refuse to remove the feature
+
+        ###############################
         self._remove_feature_from_cells(self.cells, self._cells_by_id, feature)
         return feature
 
@@ -1464,6 +1499,8 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         generalized_data = encoder.transform(generalized) if encoder else generalized
         return estimator.score(ArrayDataset(generalized_data, y_test))
 
+    ##########################################
+    ### FEATURE 1: DIFFPRIVLIB FEATURE
     def _calculate_bounds(self, x_prepared):
         """
         Helper method to extract feature bounds for diffprivlib.
@@ -1499,7 +1536,10 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                 maxs.append(col_max)
                 
         return (mins, maxs)
-    
+    ########################################
+        
+    ##########################################
+    ### FEATURE 2: L DIVERSITY FEATURE
     def _is_level_safe(self, cells):
         """
         Checks if all generalization cells satisfy the l-diversity constraint.
@@ -1525,3 +1565,29 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                 return False
                 
         return True
+    ###############################
+    
+    ###############################
+    ### FEATURE 3: RISK BOUNDING FEATURE
+    def _calculate_disclosure_risk(self, generalized_data):
+        """
+        Feature 3: Calculates the identity disclosure risk of a dataset based on 
+        Equation 6 from the paper (Goldsteen et al. (2022)).
+        Risk = sum(1/freq(r)) / total_records.
+        Mathematically, the sum of (1/freq) for all instances of a unique record equals 1.
+        Therefore, this simplifies to: (Number of Unique Records) / (Total Records).
+        """
+        if isinstance(generalized_data, pd.DataFrame):
+            str_data = generalized_data.astype(str)
+            unique_records = len(str_data.drop_duplicates())
+            total_records = len(str_data)
+        else:
+            # just in case we have raw numpy arrays
+            unique_records = len(np.unique(generalized_data, axis=0))
+            total_records = generalized_data.shape[0]
+            
+        if total_records == 0:
+            return 0
+            
+        return unique_records / total_records
+    ###############################
