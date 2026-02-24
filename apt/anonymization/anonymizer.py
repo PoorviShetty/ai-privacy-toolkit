@@ -44,7 +44,8 @@ class Anonymize:
                  quasi_identifer_slices: Optional[list] = None,
                  categorical_features: Optional[list] = None,
                  is_regression: Optional[bool] = False,
-                 train_only_QI: Optional[bool] = False):
+                 train_only_QI: Optional[bool] = False,
+                 l_diversity_threshold: Optional[float] = 0.8):
         if k < 2:
             raise ValueError("k should be a positive integer with a value of 2 or higher")
         if quasi_identifiers is None or len(quasi_identifiers) < 1:
@@ -58,6 +59,7 @@ class Anonymize:
         self.features_names = None
         self.features = None
         self.quasi_identifer_slices = quasi_identifer_slices
+        self.l_diversity_threshold = l_diversity_threshold
 
     def anonymize(self, dataset: ArrayDataset) -> DATA_PANDAS_NUMPY_TYPE:
         """
@@ -121,22 +123,37 @@ class Anonymize:
             self._anonymizer = DecisionTreeClassifier(random_state=10, min_samples_split=2, min_samples_leaf=self.k)
 
         self._anonymizer.fit(x_anonymizer_train, y)
+        
+        ##########################################
+        ### FEATURE 4: L-DIVERSITY K-ANONYMITY FEATURE
+        # apply homogenity defense
+        self._enforce_l_diversity()
+        ##########################################
+
         cells_by_id = self._calculate_cells(x, x_anonymizer_train)
         return self._anonymize_data(x, x_anonymizer_train, cells_by_id)
 
     def _calculate_cells(self, x, x_anonymizer_train):
-        # x is original data, x_anonymizer_train is only QIs + 1-hot encoded
         cells_by_id = {}
         leaves = []
-        for node, feature in enumerate(self._anonymizer.tree_.feature):
-            if feature == -2:  # leaf node
+        tree = self._anonymizer.tree_
+        
+        ##########################################
+        ### FEATURE 4: L-DIVERSITY K-ANONYMITY FEATURE
+        # Traverse tree to find only *reachable* leaves, ignoring pruned orphans
+        stack = [0]
+        while stack:
+            node = stack.pop()
+            if tree.children_left[node] == -1 and tree.children_right[node] == -1:
                 leaves.append(node)
-                hist = [int(i) for i in self._anonymizer.tree_.value[node][0]]
-                # TODO we may change the method for choosing representative for cell
-                # label_hist = self.anonymizer.tree_.value[node][0]
-                # label = int(self.anonymizer.classes_[np.argmax(label_hist)])
+                hist = [int(i) for i in tree.value[node][0]]
                 cell = {'label': 1, 'hist': hist, 'id': int(node)}
                 cells_by_id[cell['id']] = cell
+            else:
+                stack.append(tree.children_left[node])
+                stack.append(tree.children_right[node])
+        ###########################################
+                
         self._nodes = leaves
         self._find_representatives(x, x_anonymizer_train, cells_by_id.values())
         return cells_by_id
@@ -225,3 +242,57 @@ class Anonymize:
         )
         encoded = preprocessor.fit_transform(x)
         return encoded
+
+    ###############################
+    ### FEATURE 4: L-DIVERSITY K-ANONYMITY FEATURE
+    def _enforce_l_diversity(self):
+        """
+        Actively defends against Homogeneity Attacks by pruning leaves 
+        that violate the l-diversity threshold.
+        """
+        if not hasattr(self, 'l_diversity_threshold') or self.l_diversity_threshold is None:
+            return
+
+        tree = self._anonymizer.tree_
+        pruned = True
+        
+        # loop until no more pruning is necessary
+        while pruned:
+            pruned = False
+            
+            # find all currently rEACHABLE leaves from the root
+            stack = [0]
+            active_leaves = []
+            while stack:
+                node = stack.pop()
+                if tree.children_left[node] == -1 and tree.children_right[node] == -1:
+                    active_leaves.append(node)
+                else:
+                    stack.append(tree.children_left[node])
+                    stack.append(tree.children_right[node])
+            
+            # check each active leaf for homogeneity
+            for node_id in active_leaves:
+                counts = np.ravel(tree.value[node_id])
+                total = np.sum(counts)
+                
+                if total > 0:
+                    max_prob = np.max(counts) / total
+                    
+                    if max_prob > self.l_diversity_threshold:
+                        # find the parent of this unsafe leaf
+                        parent_id = np.where(tree.children_left == node_id)[0]
+                        if len(parent_id) == 0:
+                            parent_id = np.where(tree.children_right == node_id)[0]
+                        
+                        if len(parent_id) > 0:
+                            p_id = parent_id[0]
+                            
+                            # fully convert parent to a leaf
+                            tree.children_left[p_id] = -1
+                            tree.children_right[p_id] = -1
+                            tree.feature[p_id] = -2  # TREE UNDEFINED flag
+                            
+                            pruned = True
+                            print(f"ALERT: Pruned node {p_id} to enforce l-diversity.")
+                            break # restart the scan to process the newly created leaf
